@@ -10,7 +10,8 @@ It navigates deep into website hierarchies via **multi-level sub-clicking** (loc
 
 ```text
 antigravity-exporter-agent/
-├── main.py              # Core execution loop & orchestrator CLI
+├── agent.py             # Single-file standalone autonomous agent
+├── main.py              # Modular execution loop & orchestrator CLI
 ├── browser_agent.py     # Playwright navigation & multi-level sub-clicking logic
 ├── extractor.py         # Parsing logic for phones, emails, addresses, GSTINs & IECs
 ├── config.py            # Search keywords, target platforms, and human-like delays
@@ -75,7 +76,14 @@ playwright install chromium
 
 ## 🚦 Usage & Examples
 
-### Default Run (All Platforms & Default Export Categories)
+### 1. Single-File Autonomous Agent (Quick Start)
+Run the standalone, all-in-one script:
+```bash
+python agent.py
+```
+
+### 2. Full Modular Orchestrator (All Platforms & Default Export Categories)
+Run the multi-platform discovery agent:
 ```bash
 python main.py
 ```
