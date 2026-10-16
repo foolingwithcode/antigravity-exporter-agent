@@ -1,0 +1,381 @@
+"""
+Playwright-based Browser Agent for autonomous navigation, stealth discovery,
+and multi-level sub-clicking into seller portals, contact pages, and B2B directories.
+"""
+
+import asyncio
+import logging
+import random
+import re
+from typing import Dict, List, Optional
+from urllib.parse import urljoin, urlparse
+
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+
+import config
+from extractor import parse_page_data
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("BrowserAgent")
+
+
+class ExporterBrowserAgent:
+    """Autonomous Playwright agent with stealth and multi-level sub-clicking capabilities."""
+
+    def __init__(self, headless: bool = config.DEFAULT_HEADLESS):
+        self.headless = headless
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+
+    async def start(self):
+        """Initialize browser with stealth parameters to prevent bot detection."""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(
+            headless=self.headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certifcate-errors",
+                "--ignore-certifcate-errors-spki-list",
+            ],
+        )
+        self.context = await self.browser.new_context(
+            user_agent=config.USER_AGENT,
+            viewport={"width": config.VIEWPORT_WIDTH, "height": config.VIEWPORT_HEIGHT},
+            locale="en-US,en;q=0.9",
+            timezone_id="Asia/Kolkata",
+        )
+
+        # Remove navigator.webdriver detection
+        await self.context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            """
+        )
+        logger.info("Browser agent launched in stealth mode.")
+
+    async def close(self):
+        """Clean up browser resources."""
+        if self.context:
+            await self.context.close()
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+        logger.info("Browser agent stopped.")
+
+    async def random_delay(self, min_s: float = config.MIN_ACTION_DELAY, max_s: float = config.MAX_ACTION_DELAY):
+        """Human-like jitter delay between operations."""
+        await asyncio.sleep(random.uniform(min_s, max_s))
+
+    async def smooth_scroll(self, page: Page, max_scrolls: int = 3):
+        """Simulate human reading scroll to trigger lazy loading elements."""
+        for _ in range(max_scrolls):
+            scroll_by = random.randint(350, 750)
+            await page.evaluate(f"window.scrollBy({{top: {scroll_by}, behavior: 'smooth'}})")
+            await asyncio.sleep(random.uniform(0.6, 1.4))
+
+    async def dismiss_popups(self, page: Page):
+        """Attempt to close newsletter overlays, modal popups, or cookie banners."""
+        close_selectors = [
+            "button[aria-label='Close']",
+            "button.close",
+            ".modal-close",
+            "#close-button",
+            "span.close",
+            "[data-dismiss='modal']",
+            "button:has-text('Accept All')",
+            "button:has-text('I agree')",
+            "button:has-text('Got it')",
+            "button:has-text('Skip')",
+        ]
+        for sel in close_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=500):
+                    await btn.click()
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+    async def reveal_hidden_numbers(self, page: Page):
+        """Click 'View Number' or 'Show Contact' buttons to unmask phone details."""
+        for selector in config.REVEAL_NUMBER_SELECTORS:
+            try:
+                elements = await page.locator(selector).all()
+                for el in elements[:3]:  # Click up to 3 buttons per page to avoid spamming
+                    if await el.is_visible():
+                        await el.click(timeout=config.CLICK_TIMEOUT_MS)
+                        await asyncio.sleep(random.uniform(1.0, 1.8))
+            except Exception:
+                continue
+
+    async def find_contact_sublinks(self, page: Page, current_url: str) -> List[str]:
+        """Discover sub-navigation links for Contact, About, and Company details."""
+        sublinks = set()
+        base_domain = urlparse(current_url).netloc
+
+        try:
+            links = await page.locator("a[href]").all()
+            for link in links:
+                try:
+                    text = (await link.inner_text()).strip().lower()
+                    href = await link.get_attribute("href")
+                    if not href:
+                        continue
+
+                    full_url = urljoin(current_url, href)
+                    target_domain = urlparse(full_url).netloc
+
+                    # Only follow links on same domain
+                    if target_domain and target_domain != base_domain:
+                        continue
+
+                    # Match keyword text or URL slug
+                    if any(target in text for target in config.CONTACT_LINK_TEXTS) or any(
+                        target in href.lower() for target in ["contact", "about-us", "about", "reach-us", "profile"]
+                    ):
+                        # Filter out mailto/tel links from page navigation
+                        if not full_url.startswith("mailto:") and not full_url.startswith("tel:"):
+                            sublinks.add(full_url)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Error finding sublinks: {e}")
+
+        return list(sublinks)[:3]  # Return top 3 most relevant sublinks
+
+    async def deep_crawl_entity(self, page: Page, initial_url: str) -> Dict[str, any]:
+        """
+        Deep multi-level crawler:
+        1. Opens the entity's main page.
+        2. Clicks 'View Number' / reveals.
+        3. Parses primary contact data.
+        4. Navigates to 'Contact Us' / 'About Us' sub-pages.
+        5. Aggregates and returns complete lead profile.
+        """
+        aggregated_data = {
+            "phones": [],
+            "emails": [],
+            "gstins": [],
+            "iecs": [],
+            "address": "",
+            "socials": [],
+            "title": "",
+            "website": initial_url,
+        }
+
+        try:
+            logger.info(f"Navigating to entity profile: {initial_url}")
+            await page.goto(initial_url, wait_until="domcontentloaded", timeout=config.PAGE_TIMEOUT_MS)
+            await self.random_delay(1.5, 2.5)
+            await self.dismiss_popups(page)
+            await self.smooth_scroll(page, max_scrolls=2)
+            await self.reveal_hidden_numbers(page)
+
+            # Step 1: Extract from landing page
+            html = await page.content()
+            data = parse_page_data(html, initial_url)
+            self._merge_lead_data(aggregated_data, data)
+
+            # Step 2: Multi-level sub-clicking
+            if config.ENABLE_MULTI_LEVEL_CLICKING:
+                sublinks = await self.find_contact_sublinks(page, initial_url)
+                for sublink in sublinks:
+                    if sublink == initial_url:
+                        continue
+                    try:
+                        logger.info(f"Sub-clicking into contact page: {sublink}")
+                        await page.goto(sublink, wait_until="domcontentloaded", timeout=config.PAGE_TIMEOUT_MS)
+                        await self.random_delay(1.0, 2.0)
+                        await self.dismiss_popups(page)
+                        await self.reveal_hidden_numbers(page)
+
+                        sub_html = await page.content()
+                        sub_data = parse_page_data(sub_html, sublink)
+                        self._merge_lead_data(aggregated_data, sub_data)
+                    except Exception as e:
+                        logger.debug(f"Failed sub-page crawl {sublink}: {e}")
+
+        except Exception as e:
+            logger.warning(f"Error deep-crawling {initial_url}: {e}")
+
+        return aggregated_data
+
+    def _merge_lead_data(self, target: Dict[str, any], source: Dict[str, any]):
+        """Merge newly discovered data into the existing lead profile."""
+        target["phones"] = list(dict.fromkeys(target["phones"] + source.get("phones", [])))
+        target["emails"] = list(dict.fromkeys(target["emails"] + source.get("emails", [])))
+        target["gstins"] = list(dict.fromkeys(target["gstins"] + source.get("gstins", [])))
+        target["iecs"] = list(dict.fromkeys(target["iecs"] + source.get("iecs", [])))
+        target["socials"] = list(dict.fromkeys(target["socials"] + source.get("socials", [])))
+        if not target["address"] and source.get("address"):
+            target["address"] = source["address"]
+        if not target["title"] and source.get("title"):
+            target["title"] = source["title"]
+
+    async def search_and_discover(self, platform_key: str, query: str) -> List[Dict[str, any]]:
+        """Run platform-specific discovery and deep lead extraction."""
+        platform = config.PLATFORMS.get(platform_key)
+        if not platform or not platform.get("enabled"):
+            logger.warning(f"Platform {platform_key} is disabled or unknown.")
+            return []
+
+        search_url = platform["search_url_template"].format(query=query.replace(" ", "+"))
+        logger.info(f"Searching on {platform['name']} for query '{query}': {search_url}")
+
+        page = await self.context.new_page()
+        discovered_leads: List[Dict[str, any]] = []
+
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=config.PAGE_TIMEOUT_MS)
+            await self.random_delay(2.0, 3.5)
+            await self.dismiss_popups(page)
+            await self.smooth_scroll(page, max_scrolls=3)
+
+            # Discover candidate entity links depending on platform
+            candidate_links = await self._extract_platform_listing_links(page, platform_key)
+            logger.info(f"Found {len(candidate_links)} candidates on {platform['name']}.")
+
+            for item in candidate_links[:config.MAX_LEADS_PER_KEYWORD]:
+                entity_url = item.get("url")
+                company_name = item.get("name", "")
+
+                if not entity_url:
+                    continue
+
+                lead_data = await self.deep_crawl_entity(page, entity_url)
+                lead_data["company_name"] = company_name or lead_data.get("title", "Unknown Company")
+                lead_data["platform"] = platform["name"]
+                lead_data["query"] = query
+                lead_data["source_url"] = entity_url
+
+                # Only keep leads with at least a phone number, email, or company name
+                if lead_data["phones"] or lead_data["emails"] or company_name:
+                    discovered_leads.append(lead_data)
+                    logger.info(
+                        f"Extracted lead: {lead_data['company_name']} | "
+                        f"Phones: {len(lead_data['phones'])} | Emails: {len(lead_data['emails'])}"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error during search on {platform_key}: {e}")
+        finally:
+            await page.close()
+
+        return discovered_leads
+
+    async def _extract_platform_listing_links(self, page: Page, platform_key: str) -> List[Dict[str, str]]:
+        """Extract candidate exporter listing links and names from search results."""
+        results = []
+
+        try:
+            if platform_key == "indiamart":
+                # IndiaMART supplier cards
+                cards = await page.locator(".card, .listing, .r-cl, .gpcls").all()
+                for card in cards[:12]:
+                    try:
+                        name_el = card.locator("h2, .company-name, .lcname, .to-fnt, a.bold").first
+                        name = (await name_el.inner_text()).strip() if await name_el.count() > 0 else ""
+                        link_el = card.locator("a[href*='indiamart.com']").first
+                        href = await link_el.get_attribute("href") if await link_el.count() > 0 else ""
+                        if href and name:
+                            results.append({"name": name, "url": href})
+                    except Exception:
+                        continue
+
+            elif platform_key == "tradeindia":
+                # TradeIndia supplier listings
+                cards = await page.locator(".co-name, .catalog-title, .listing-title, .company-details").all()
+                for card in cards[:12]:
+                    try:
+                        link_el = card.locator("a[href]").first
+                        href = await link_el.get_attribute("href") if await link_el.count() > 0 else ""
+                        name = (await link_el.inner_text()).strip() if href else ""
+                        if href and name:
+                            full_url = urljoin("https://www.tradeindia.com", href)
+                            results.append({"name": name, "url": full_url})
+                    except Exception:
+                        continue
+
+            elif platform_key == "etsy":
+                # Etsy shops & listings
+                shop_links = await page.locator("a[href*='/shop/']").all()
+                seen = set()
+                for link in shop_links[:12]:
+                    try:
+                        href = await link.get_attribute("href")
+                        if href and "/shop/" in href:
+                            shop_url = href.split("?")[0]
+                            if shop_url not in seen:
+                                seen.add(shop_url)
+                                name = shop_url.split("/shop/")[-1].replace("/", "")
+                                results.append({"name": name.capitalize(), "url": shop_url})
+                    except Exception:
+                        continue
+
+            elif platform_key == "ebay":
+                # eBay sellers
+                seller_links = await page.locator("a[href*='/str/'], a[href*='/usr/']").all()
+                seen = set()
+                for link in seller_links[:12]:
+                    try:
+                        href = await link.get_attribute("href")
+                        if href and ("/str/" in href or "/usr/" in href):
+                            clean_url = href.split("?")[0]
+                            if clean_url not in seen:
+                                seen.add(clean_url)
+                                seller_name = clean_url.rstrip("/").split("/")[-1]
+                                results.append({"name": seller_name, "url": clean_url})
+                    except Exception:
+                        continue
+
+            elif platform_key == "shopify":
+                # Google search results for Shopify stores
+                search_results = await page.locator("a[href^='http']").all()
+                seen = set()
+                for link in search_results:
+                    try:
+                        href = await link.get_attribute("href")
+                        if not href:
+                            continue
+                        parsed = urlparse(href)
+                        domain = parsed.netloc.lower()
+                        if "google." in domain or "youtube." in domain or "shopify.com" == domain:
+                            continue
+                        if ("myshopify.com" in domain or parsed.scheme in ["http", "https"]) and domain not in seen:
+                            seen.add(domain)
+                            store_url = f"{parsed.scheme}://{domain}"
+                            name = domain.split(".")[0].replace("-", " ").title()
+                            results.append({"name": name, "url": store_url})
+                            if len(results) >= 10:
+                                break
+                    except Exception:
+                        continue
+
+            elif platform_key == "amazon":
+                # Amazon seller store links
+                seller_links = await page.locator("a[href*='/s?me='], a[href*='/sp?seller=']").all()
+                seen = set()
+                for link in seller_links[:10]:
+                    try:
+                        href = await link.get_attribute("href")
+                        if href:
+                            full_url = urljoin("https://www.amazon.in", href)
+                            name = (await link.inner_text()).strip()
+                            if full_url not in seen:
+                                seen.add(full_url)
+                                results.append({"name": name or "Amazon Global Seller", "url": full_url})
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            logger.warning(f"Error parsing listing links for {platform_key}: {e}")
+
+        return results
