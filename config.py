@@ -57,8 +57,8 @@ PLATFORMS = {
     },
     "shopify": {
         "name": "Shopify D2C Indian Exporters",
-        "base_url": "https://www.google.com",
-        "search_url_template": "https://www.google.com/search?q=site%3Amyshopify.com+India+worldwide+shipping+{query}",
+        "base_url": "https://www.bing.com",
+        "search_url_template": "https://www.bing.com/search?q=site%3Amyshopify.com+India+{query}",
         "enabled": True,
     }
 }

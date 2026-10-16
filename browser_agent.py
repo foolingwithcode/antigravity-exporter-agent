@@ -137,10 +137,13 @@ class ExporterBrowserAgent:
                     if target_domain and target_domain != base_domain:
                         continue
 
-                    # Match keyword text or URL slug
-                    if any(target in text for target in config.CONTACT_LINK_TEXTS) or any(
-                        target in href.lower() for target in ["contact", "about-us", "about", "reach-us", "profile"]
-                    ):
+                    # Match keyword text, URL slug, or seller profile pattern
+                    is_contact_pattern = any(target in text for target in config.CONTACT_LINK_TEXTS) or any(
+                        target in href.lower() for target in ["contact", "about-us", "about", "reach-us", "profile", "at-a-glance"]
+                    )
+                    is_seller_profile = bool(re.search(r"tradeindia\.com/[a-z0-9\-]+-\d+/?", full_url))
+
+                    if is_contact_pattern or is_seller_profile:
                         # Filter out mailto/tel links from page navigation
                         if not full_url.startswith("mailto:") and not full_url.startswith("tel:"):
                             sublinks.add(full_url)
@@ -251,13 +254,23 @@ class ExporterBrowserAgent:
                     continue
 
                 lead_data = await self.deep_crawl_entity(page, entity_url)
-                lead_data["company_name"] = company_name or lead_data.get("title", "Unknown Company")
+                title = lead_data.get("title", "")
+                resolved_name = company_name
+                if (not resolved_name or resolved_name in ["TradeIndia Exporter", "IndiaMART Supplier", "Unknown Company"]) and title:
+                    if "|" in title:
+                        resolved_name = title.split("|")[-1].strip()
+                    elif " - " in title:
+                        resolved_name = title.split(" - ")[0].strip()
+                    else:
+                        resolved_name = title
+
+                lead_data["company_name"] = resolved_name or "Unknown Company"
                 lead_data["platform"] = platform["name"]
                 lead_data["query"] = query
                 lead_data["source_url"] = entity_url
 
-                # Only keep leads with at least a phone number, email, or company name
-                if lead_data["phones"] or lead_data["emails"] or company_name:
+                # Keep leads with either phone, email, gstin, address, or verified company name
+                if lead_data["phones"] or lead_data["emails"] or lead_data["gstins"] or lead_data["address"]:
                     discovered_leads.append(lead_data)
                     logger.info(
                         f"Extracted lead: {lead_data['company_name']} | "
@@ -276,69 +289,77 @@ class ExporterBrowserAgent:
         results = []
 
         try:
-            if platform_key == "indiamart":
-                # IndiaMART supplier cards
-                cards = await page.locator(".card, .listing, .r-cl, .gpcls").all()
-                for card in cards[:12]:
+            if platform_key == "tradeindia":
+                # Primary: TradeIndia product and catalog cards
+                links = await page.locator("a[href*='/products/'], a[href*='-c'], a.listing-title, .co-name a").all()
+                seen = set()
+                for link in links:
                     try:
-                        name_el = card.locator("h2, .company-name, .lcname, .to-fnt, a.bold").first
-                        name = (await name_el.inner_text()).strip() if await name_el.count() > 0 else ""
-                        link_el = card.locator("a[href*='indiamart.com']").first
-                        href = await link_el.get_attribute("href") if await link_el.count() > 0 else ""
-                        if href and name:
-                            results.append({"name": name, "url": href})
-                    except Exception:
-                        continue
-
-            elif platform_key == "tradeindia":
-                # TradeIndia supplier listings
-                cards = await page.locator(".co-name, .catalog-title, .listing-title, .company-details").all()
-                for card in cards[:12]:
-                    try:
-                        link_el = card.locator("a[href]").first
-                        href = await link_el.get_attribute("href") if await link_el.count() > 0 else ""
-                        name = (await link_el.inner_text()).strip() if href else ""
-                        if href and name:
+                        href = await link.get_attribute("href")
+                        if not href or href in seen:
+                            continue
+                        name = (await link.inner_text()).strip()
+                        if "/products/" in href or "-c" in href:
+                            seen.add(href)
                             full_url = urljoin("https://www.tradeindia.com", href)
-                            results.append({"name": name, "url": full_url})
+                            clean_name = name.split("-")[0].strip() if name else "TradeIndia Exporter"
+                            results.append({"name": clean_name, "url": full_url})
+                            if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                                break
                     except Exception:
                         continue
 
-            elif platform_key == "etsy":
-                # Etsy shops & listings
-                shop_links = await page.locator("a[href*='/shop/']").all()
-                seen = set()
-                for link in shop_links[:12]:
+                # Fallback: if search page had 0, try category page
+                if not results:
+                    current_url = page.url
+                    query_term = current_url.split("keyword=")[-1].split("&")[0].split("+")[0]
+                    cat_url = f"https://www.tradeindia.com/manufacturers/{query_term}.html"
                     try:
-                        href = await link.get_attribute("href")
-                        if href and "/shop/" in href:
-                            shop_url = href.split("?")[0]
-                            if shop_url not in seen:
-                                seen.add(shop_url)
-                                name = shop_url.split("/shop/")[-1].replace("/", "")
-                                results.append({"name": name.capitalize(), "url": shop_url})
+                        await page.goto(cat_url, wait_until="domcontentloaded", timeout=15000)
+                        await asyncio.sleep(2)
+                        cat_links = await page.locator("a[href*='/products/']").all()
+                        for link in cat_links:
+                            href = await link.get_attribute("href")
+                            if href and href not in seen:
+                                seen.add(href)
+                                full_url = urljoin("https://www.tradeindia.com", href)
+                                name = (await link.inner_text()).strip()
+                                results.append({"name": name or "TradeIndia Exporter", "url": full_url})
+                                if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                                    break
                     except Exception:
-                        continue
+                        pass
 
-            elif platform_key == "ebay":
-                # eBay sellers
-                seller_links = await page.locator("a[href*='/str/'], a[href*='/usr/']").all()
+            elif platform_key == "indiamart":
+                # IndiaMART supplier cards and product links
+                selectors = [
+                    "a.clsp", ".bo-name a", ".prod-name a",
+                    "a[href*='indiamart.com/proddtl/']", "a[href*='indiamart.com/company/']",
+                    ".gpcls a", ".card a", "a.to-fnt", "a.bold"
+                ]
                 seen = set()
-                for link in seller_links[:12]:
-                    try:
-                        href = await link.get_attribute("href")
-                        if href and ("/str/" in href or "/usr/" in href):
-                            clean_url = href.split("?")[0]
-                            if clean_url not in seen:
-                                seen.add(clean_url)
-                                seller_name = clean_url.rstrip("/").split("/")[-1]
-                                results.append({"name": seller_name, "url": clean_url})
-                    except Exception:
-                        continue
+                for sel in selectors:
+                    cards = await page.locator(sel).all()
+                    for card in cards:
+                        try:
+                            href = await card.get_attribute("href")
+                            if not href or href in seen:
+                                continue
+                            if any(skip in href for skip in ["help.", "seller.", "corporate.", "blog.", "terms"]):
+                                continue
+                            seen.add(href)
+                            name = (await card.inner_text()).strip() or "IndiaMART Supplier"
+                            results.append({"name": name, "url": href})
+                            if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                                break
+                        except Exception:
+                            continue
+                    if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                        break
 
             elif platform_key == "shopify":
-                # Google search results for Shopify stores
-                search_results = await page.locator("a[href^='http']").all()
+                # Bing search results for Shopify Indian exporter stores
+                search_results = await page.locator("li.b_algo h2 a, a[href^='http']").all()
                 seen = set()
                 for link in search_results:
                     try:
@@ -347,31 +368,70 @@ class ExporterBrowserAgent:
                             continue
                         parsed = urlparse(href)
                         domain = parsed.netloc.lower()
-                        if "google." in domain or "youtube." in domain or "shopify.com" == domain:
+                        if any(skip in domain for skip in ["bing.", "microsoft.", "google.", "wikipedia.", "gov.in", "ndtv."]):
                             continue
-                        if ("myshopify.com" in domain or parsed.scheme in ["http", "https"]) and domain not in seen:
+                        if domain not in seen:
                             seen.add(domain)
                             store_url = f"{parsed.scheme}://{domain}"
                             name = domain.split(".")[0].replace("-", " ").title()
                             results.append({"name": name, "url": store_url})
-                            if len(results) >= 10:
+                            if len(results) >= config.MAX_LEADS_PER_KEYWORD:
                                 break
                     except Exception:
                         continue
 
             elif platform_key == "amazon":
-                # Amazon seller store links
-                seller_links = await page.locator("a[href*='/s?me='], a[href*='/sp?seller=']").all()
+                # Amazon India search results
+                prod_links = await page.locator("a.a-link-normal.s-no-outline, .s-result-item h2 a").all()
                 seen = set()
-                for link in seller_links[:10]:
+                for link in prod_links:
                     try:
                         href = await link.get_attribute("href")
-                        if href:
+                        if not href or href in seen:
+                            continue
+                        if "/dp/" in href:
+                            seen.add(href)
                             full_url = urljoin("https://www.amazon.in", href)
-                            name = (await link.inner_text()).strip()
-                            if full_url not in seen:
-                                seen.add(full_url)
-                                results.append({"name": name or "Amazon Global Seller", "url": full_url})
+                            name = (await link.inner_text()).strip() or "Amazon Exporter"
+                            results.append({"name": name, "url": full_url})
+                            if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                                break
+                    except Exception:
+                        continue
+
+            elif platform_key == "etsy":
+                # Etsy shops & listing cards
+                shop_links = await page.locator("a[href*='/shop/'], a.listing-link, a[href*='/listing/']").all()
+                seen = set()
+                for link in shop_links:
+                    try:
+                        href = await link.get_attribute("href")
+                        if not href or href in seen:
+                            continue
+                        seen.add(href)
+                        clean_url = href.split("?")[0]
+                        name = (await link.inner_text()).strip() or "Etsy Artisan"
+                        results.append({"name": name, "url": clean_url})
+                        if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                            break
+                    except Exception:
+                        continue
+
+            elif platform_key == "ebay":
+                # eBay items and sellers
+                items = await page.locator(".s-item__link, a[href*='/itm/'], a[href*='/str/']").all()
+                seen = set()
+                for item in items:
+                    try:
+                        href = await item.get_attribute("href")
+                        if not href or href in seen:
+                            continue
+                        seen.add(href)
+                        clean_url = href.split("?")[0]
+                        name = (await item.inner_text()).strip() or "eBay Seller"
+                        results.append({"name": name, "url": clean_url})
+                        if len(results) >= config.MAX_LEADS_PER_KEYWORD:
+                            break
                     except Exception:
                         continue
 

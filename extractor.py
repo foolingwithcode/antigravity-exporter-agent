@@ -46,6 +46,12 @@ IGNORED_EMAIL_DOMAINS = {
     "test.com",
     "cloudflare.com",
     "akamai.com",
+    "tradeindia.com",
+    "indiamart.com",
+    "ebay.com",
+    "etsy.com",
+    "amazon.in",
+    "amazon.com",
 }
 
 IGNORED_EMAIL_EXTENSIONS = (
